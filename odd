@@ -1,0 +1,1000 @@
+#!/usr/bin/env node
+'use strict';
+
+/*
+ * odd — like `npm outdated`, plus a "Published" column showing how long ago
+ * the latest version was published (it also reproduces npm's "Depended by"
+ * column). The Published value is shown in red when
+ * the latest version was published within the cooldown period (default 7
+ * days, configurable with -c/--cooldown).
+ *
+ * Usage:
+ *   odd [options] [path]        # path defaults to the current directory
+ *
+ * Exit code is 1 when outdated packages are found (matching `npm outdated`),
+ * 0 otherwise. Uses only Node.js built-ins — no external dependencies.
+ *
+ * Packuments are fetched with gzip and a keep-alive agent, and cached in npm's
+ * own content-addressable cache (~/.npm/_cacache, override with ODD_CACHE_DIR)
+ * so odd shares and reuses the same cache npm itself maintains. Entries are
+ * trusted for ODD_CACHE_TTL minutes (default 60; 0 disables caching).
+ */
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
+const zlib = require('zlib');
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+// Colors match `npm outdated` (lib/commands/outdated.js #pretty):
+//   header: bold+underline; package name: yellow when current===wanted (an
+//   in-range update), red when current!==wanted (newer major); Wanted: cyan;
+//   Latest: blue. Published keeps its own rule: red when < 7 days old.
+
+const COLORS = {
+  red: '\x1b[31m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  cyan: '\x1b[36m',
+  boldUnderline: '\x1b[1m\x1b[4m',
+};
+const RESET = '\x1b[0m';
+const useColor =
+  (process.stdout.isTTY && process.env.NO_COLOR == null) ||
+  process.env.FORCE_COLOR === '1';
+
+function colorize(str, code) {
+  return useColor ? code + str + RESET : str;
+}
+
+function visibleWidth(str) {
+  // Strip ANSI escape sequences so column alignment ignores color codes.
+  return str.replace(/\x1b\[[0-9;]*m/g, '').length;
+}
+
+// Align using the built-in String#padEnd/String#padStart, widening the target
+// width by the escape-sequence overhead so colored strings align correctly.
+// Padding lands outside the color codes, matching npm's text-table output
+// (e.g. the header underline covers only the word, not the trailing spaces).
+function alignLeft(str, width) {
+  return str.padEnd(width + str.length - visibleWidth(str));
+}
+
+function alignRight(str, width) {
+  return str.padStart(width + str.length - visibleWidth(str));
+}
+
+// ---------------------------------------------------------------------------
+// Minimal semver implementation (no external dependencies)
+// ---------------------------------------------------------------------------
+
+function parseVersion(v) {
+  if (typeof v !== 'string') return null;
+  const m = v
+    .trim()
+    .match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/);
+  if (!m) return null;
+  return {
+    major: +m[1],
+    minor: +m[2],
+    patch: +m[3],
+    prerelease: m[4] ? m[4].split('.') : [],
+  };
+}
+
+function cmpVersions(a, b) {
+  for (const k of ['major', 'minor', 'patch']) {
+    if (a[k] !== b[k]) return a[k] < b[k] ? -1 : 1;
+  }
+  const ap = a.prerelease;
+  const bp = b.prerelease;
+  if (ap.length === 0 && bp.length === 0) return 0;
+  if (ap.length === 0) return 1; // release > prerelease
+  if (bp.length === 0) return -1;
+  const len = Math.max(ap.length, bp.length);
+  for (let i = 0; i < len; i++) {
+    const x = ap[i];
+    const y = bp[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) {
+      if (+x !== +y) return +x < +y ? -1 : 1;
+    } else if (xn !== yn) {
+      return xn ? -1 : 1; // numeric identifiers < alphanumeric
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+const isX = (s) => s === undefined || s === 'x' || s === 'X' || s === '*';
+
+// Parse a single comparator (e.g. "^1.2", "~0.2.3", ">=1", "1.2.x", "*")
+// into a list of primitive comparators: { op: '>='|'>'|'<'|'<='|'=', ver }.
+// Returns null if the comparator cannot be parsed.
+function parseComparator(raw) {
+  let comp = raw.trim().replace(/^([<>=~^]+)\s+/, '$1');
+  if (comp === '' || comp === '*' || comp === 'x' || comp === 'X' || comp === 'latest') return [];
+
+  let op = '';
+  const mop = comp.match(/^(<=|>=|<|>|=|~|\^)/);
+  if (mop) {
+    op = mop[1];
+    comp = comp.slice(op.length).trim();
+  }
+
+  const mp = comp.match(
+    /^v?(\d+|x|X|\*)(?:\.(\d+|x|X|\*))?(?:\.(\d+|x|X|\*))?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+  );
+  if (!mp) return null;
+
+  const majorX = isX(mp[1]);
+  const minorX = isX(mp[2]);
+  const patchX = isX(mp[3]);
+  const major = majorX ? 0 : +mp[1];
+  const minor = minorX ? 0 : +mp[2];
+  const patch = patchX ? 0 : +mp[3];
+  const prerelease = mp[4] ? mp[4].split('.') : [];
+
+  const base = { major, minor, patch, prerelease };
+  const release = { major, minor, patch, prerelease: [] };
+  const gt = (v) => ({ op: '>=', ver: v });
+  const lt = (v) => ({ op: '<', ver: v });
+  const nextMajor = { major: major + 1, minor: 0, patch: 0, prerelease: ['0'] };
+  const nextMinor = { major, minor: minor + 1, patch: 0, prerelease: ['0'] };
+  const nextPatch = { major, minor, patch: patch + 1, prerelease: ['0'] };
+
+  switch (op) {
+    case '':
+    case '=': {
+      if (majorX) return [];
+      if (minorX) return [gt(release), lt(nextMajor)];
+      if (patchX) return [gt(release), lt(nextMinor)];
+      return [{ op: '=', ver: base }];
+    }
+    case '~': {
+      if (majorX) return [];
+      if (minorX) return [gt(release), lt(nextMajor)];
+      return [gt(release), lt(nextMinor)];
+    }
+    case '^': {
+      if (majorX) return [];
+      if (minorX) return [gt(release), lt(nextMajor)];
+      if (patchX) return major === 0 ? [gt(release), lt(nextMinor)] : [gt(release), lt(nextMajor)];
+      if (major > 0) return [gt(base), lt(nextMajor)];
+      if (minor > 0) return [gt(base), lt(nextMinor)];
+      return [gt(base), lt(nextPatch)];
+    }
+    case '>': {
+      if (majorX) return [{ op: '<', ver: { major: 0, minor: 0, patch: 0, prerelease: ['0'] } }];
+      if (minorX) return [gt({ major: major + 1, minor: 0, patch: 0, prerelease: [] })];
+      if (patchX) return [gt(nextMinor)];
+      return [{ op: '>', ver: base }];
+    }
+    case '>=': {
+      if (majorX) return [];
+      return [gt(base)];
+    }
+    case '<': {
+      if (majorX) return [{ op: '<', ver: { major: 0, minor: 0, patch: 0, prerelease: ['0'] } }];
+      if (minorX) return [lt(release)];
+      if (patchX) return [lt(release)];
+      return [{ op: '<', ver: base }];
+    }
+    case '<=': {
+      if (majorX) return [];
+      if (minorX) return [lt(nextMajor)];
+      if (patchX) return [lt(nextMinor)];
+      return [{ op: '<=', ver: base }];
+    }
+  }
+  return null;
+}
+
+// Parse one "&&" comparator set (a hyphen range or space-separated comparators).
+// Returns { comparators: [...] } or null if invalid.
+function parseComparatorSet(str) {
+  str = str.trim();
+  if (str === '') return { comparators: [] };
+
+  // Hyphen ranges: "1.2.3 - 2.3.4", "1.2 - 2"
+  const hyphen = str.match(/^(\S+)\s+-\s+(\S+)$/);
+  if (hyphen) {
+    const comparators = [];
+    const lo = parseComparator(hyphen[1]);
+    if (lo === null) return null;
+    comparators.push(...lo.map((c) => (c.op === '=' ? { op: '>=', ver: c.ver } : c)));
+
+    const hi = parseComparator('=' + hyphen[2]);
+    if (hi === null) return null;
+    // Upper bound: inclusive for full versions, exclusive for partials.
+    const mp = hyphen[2].match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+    if (mp && (mp[2] === undefined || mp[3] === undefined)) {
+      const major = +mp[1];
+      const minor = mp[2] === undefined ? 0 : +mp[2];
+      if (mp[2] === undefined) {
+        comparators.push({ op: '<', ver: { major: major + 1, minor: 0, patch: 0, prerelease: ['0'] } });
+      } else {
+        comparators.push({ op: '<', ver: { major, minor: minor + 1, patch: 0, prerelease: ['0'] } });
+      }
+    } else {
+      comparators.push(...hi);
+    }
+    return { comparators };
+  }
+
+  const comparators = [];
+  for (const part of str.split(/\s+/)) {
+    const parsed = parseComparator(part);
+    if (parsed === null) return null;
+    comparators.push(...parsed);
+  }
+  return { comparators };
+}
+
+// Returns true if `ver` satisfies `range` (e.g. "^1.2.0 || >=2 <3.0.0-0").
+function satisfies(ver, range) {
+  if (typeof range !== 'string') return false;
+  for (const setStr of range.split('||')) {
+    const set = parseComparatorSet(setStr);
+    if (set === null) continue;
+    let ok = true;
+    for (const c of set.comparators) {
+      const r = cmpVersions(ver, c.ver);
+      if (
+        (c.op === '>' && !(r > 0)) ||
+        (c.op === '>=' && !(r >= 0)) ||
+        (c.op === '<' && !(r < 0)) ||
+        (c.op === '<=' && !(r <= 0)) ||
+        (c.op === '=' && r !== 0)
+      ) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    // Prerelease versions only satisfy ranges that explicitly opt in via a
+    // comparator on the same [major, minor, patch] tuple with a prerelease.
+    if (ver.prerelease.length > 0) {
+      const allowed = set.comparators.some(
+        (c) =>
+          c.ver.prerelease.length > 0 &&
+          c.ver.major === ver.major &&
+          c.ver.minor === ver.minor &&
+          c.ver.patch === ver.patch
+      );
+      if (!allowed) continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Terminal spinner (mirrors npm's Progress class in lib/utils/display.js)
+// ---------------------------------------------------------------------------
+// Taken from npm's use of cli-spinners (MIT, sindresorhus). Renders to stderr
+// only, waits 200ms before starting so short operations never flash, and
+// erases itself with cursorTo(0) + clearLine(1).
+
+class Progress {
+  static dots = { duration: 80, frames: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] };
+  static lines = { duration: 130, frames: ['-', '\\', '|', '/'] };
+
+  #enabled = false;
+  #frameIndex = 0;
+  #interval;
+  #lastUpdate = 0;
+  #spinner;
+  #stream;
+  #timeout;
+  #rendered = false;
+
+  get #rendering() {
+    return this.#enabled && !this.#timeout;
+  }
+
+  get #spinning() {
+    return this.#enabled && this.#interval;
+  }
+
+  constructor({ stream }) {
+    this.#stream = stream;
+  }
+
+  load({ enabled, unicode }) {
+    this.#enabled = enabled;
+    this.#spinner = unicode ? Progress.dots : Progress.lines;
+    // Wait 200 ms so we don't render the spinner for short durations
+    this.#timeout = setTimeout(() => {
+      this.#timeout = null;
+      this.#render();
+    }, 200);
+    // Make sure this timeout does not keep the process open
+    this.#timeout.unref();
+  }
+
+  off() {
+    if (!this.#enabled) {
+      return;
+    }
+    clearTimeout(this.#timeout);
+    this.#timeout = null;
+    clearInterval(this.#interval);
+    this.#interval = null;
+    this.#frameIndex = 0;
+    this.#lastUpdate = 0;
+    this.#clearSpinner();
+  }
+
+  #render(resuming) {
+    if (!this.#rendering) {
+      return;
+    }
+    // We always attempt to render immediately but we only request to move to
+    // the next frame if it has been longer than the frame duration.
+    this.#renderFrame(Date.now() - this.#lastUpdate >= this.#spinner.duration, resuming);
+    if (!this.#interval) {
+      this.#interval = setInterval(() => this.#renderFrame(true), this.#spinner.duration);
+      this.#interval.unref();
+    }
+    this.#interval.refresh();
+  }
+
+  #renderFrame(next, resuming) {
+    if (next) {
+      this.#lastUpdate = Date.now();
+      this.#frameIndex++;
+      if (this.#frameIndex >= this.#spinner.frames.length) {
+        this.#frameIndex = 0;
+      }
+    }
+    if (!resuming) {
+      this.#clearSpinner();
+    }
+    this.#stream.write(this.#spinner.frames[this.#frameIndex]);
+    this.#rendered = true;
+  }
+
+  #clearSpinner() {
+    if (!this.#rendered) {
+      return;
+    }
+    // Move to the start of the line and clear the rest of the line
+    this.#stream.cursorTo(0);
+    this.#stream.clearLine(1);
+    this.#rendered = false;
+  }
+}
+
+// npm's `progress` config default: off when stderr is not a TTY or in CI.
+const progress = new Progress({ stream: process.stderr });
+
+// ---------------------------------------------------------------------------
+// Humanized relative time
+// ---------------------------------------------------------------------------
+
+function humanizeDuration(ms) {
+  const units = [
+    [365 * 24 * 60 * 60 * 1000, 'year'],
+    [30 * 24 * 60 * 60 * 1000, 'month'],
+    [7 * 24 * 60 * 60 * 1000, 'week'],
+    [24 * 60 * 60 * 1000, 'day'],
+    [60 * 60 * 1000, 'hour'],
+    [60 * 1000, 'minute'],
+    [1000, 'second'],
+  ];
+  for (const [size, name] of units) {
+    if (ms >= size) {
+      const n = Math.floor(ms / size);
+      return `${n} ${name}${n === 1 ? '' : 's'} ago`;
+    }
+  }
+  return 'just now';
+}
+
+// ---------------------------------------------------------------------------
+// npm cache (cacache) access
+// ---------------------------------------------------------------------------
+
+// Keep-alive agent: reuses TLS connections across packument fetches instead of
+// paying a fresh TCP+TLS handshake per request.
+const agent = new https.Agent({ keepAlive: true, maxSockets: 8 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8 });
+
+// npm stores cached responses in a content-addressable store ("cacache"):
+//   <cache>/content-v2/sha512/<h0-2>/<h2-4>/<h4->  — raw body, h = hex of the
+//                                                    base64 payload of the
+//                                                    sha512-<b64> integrity
+//   <cache>/index-v5/<s0-2>/<s2-4>/<s4->           — append-only log of lines
+// where s = sha256(key) hex, and each line is "<sha1(json)>\t<json>" with
+// json = {key, integrity, time, size, ...}. Writing entries here means odd
+// shares and reuses the exact cache npm itself maintains (and vice versa).
+
+const CACHE_TTL_MS =
+  Math.max(0, parseInt(process.env.ODD_CACHE_TTL || '60', 10) || 0) * 60 * 1000;
+
+function cacheRoot() {
+  return process.env.ODD_CACHE_DIR || path.join(os.homedir(), '.npm', '_cacache');
+}
+
+function sha1hex(str) {
+  return crypto.createHash('sha1').update(str).digest('hex');
+}
+
+function sha256hex(str) {
+  return crypto.createHash('sha256').update(str).digest('hex');
+}
+
+// Read the newest unexpired index entry for `key`, if any.
+function readCacheIndex(cache, key) {
+  try {
+    const s = sha256hex(key);
+    const file = path.join(cache, 'index-v5', s.slice(0, 2), s.slice(2, 4), s.slice(4));
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    let best = null;
+    for (const line of lines) {
+      // A line is normally "<sha1>\t<json>", but concurrent appends by npm and
+      // odd can interleave multiple records onto one line. Scan for every
+      // embedded JSON object and validate each individually: a record is
+      // authentic if its sha1 appears in the line (as the line prefix, or as
+      // the hash that was appended immediately before it).
+      for (const json of extractJsonObjects(line)) {
+        if (!line.includes(sha1hex(json))) continue;
+        let entry;
+        try {
+          entry = JSON.parse(json);
+        } catch {
+          continue;
+        }
+        if (entry.key !== key || !entry.integrity) continue;
+        if (CACHE_TTL_MS === 0 || Date.now() - entry.time > CACHE_TTL_MS) continue;
+        if (!best || entry.time > best.time) best = entry;
+      }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+// Extract balanced-brace JSON object substrings starting at each '{"key":'
+// occurrence. Handles records that were concatenated by interleaved appends.
+function extractJsonObjects(str) {
+  const out = [];
+  let idx = str.indexOf('{"key":');
+  while (idx !== -1) {
+    let depth = 0;
+    let end = -1;
+    for (let i = idx; i < str.length; i++) {
+      if (str[i] === '{') depth++;
+      else if (str[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
+    }
+    }
+    if (end === -1) break;
+    out.push(str.slice(idx, end));
+    idx = str.indexOf('{"key":', end);
+  }
+  return out;
+}
+
+function readCacheContent(cache, integrity) {
+  try {
+    const m = integrity.match(/^sha512-([A-Za-z0-9+/]+={0,2})$/);
+    if (!m) return null;
+    const hex = Buffer.from(m[1], 'base64').toString('hex');
+    const file = path.join(cache, 'content-v2', 'sha512', hex.slice(0, 2), hex.slice(2, 4), hex.slice(4));
+    const buf = fs.readFileSync(file);
+    // Verify content hash; a mismatch means the store is inconsistent.
+    const actual = 'sha512-' + crypto.createHash('sha512').update(buf).digest('base64');
+    return actual === integrity ? buf : null;
+  } catch {
+    return null;
+  }
+}
+
+function readCache(cache, key) {
+  const entry = readCacheIndex(cache, key);
+  if (!entry) return null;
+  return readCacheContent(cache, entry.integrity);
+}
+
+// The Accept header odd asks for, and the only request header npm records in
+// cache metadata for a packument (minipass-fetch adds accept-encoding below the
+// Request object, so it is absent from npm's reqHeaders too — see
+// make-fetch-happen/lib/cache/entry.js #getMetadata).
+const PACKUMENT_ACCEPT = 'application/json';
+
+// Response headers make-fetch-happen persists in cache metadata, in this order.
+const KEEP_RESPONSE_HEADERS = [
+  'cache-control',
+  'content-encoding',
+  'content-language',
+  'content-type',
+  'date',
+  'etag',
+  'expires',
+  'last-modified',
+  'link',
+  'location',
+  'pragma',
+  'vary',
+];
+
+function writeCache(cache, key, url, buf, resHeaders) {
+  try {
+    const integrity = 'sha512-' + crypto.createHash('sha512').update(buf).digest('base64');
+    const hex = Buffer.from(integrity.slice(7), 'base64').toString('hex');
+    const contentDir = path.join(cache, 'content-v2', 'sha512', hex.slice(0, 2), hex.slice(2, 4));
+    fs.mkdirSync(contentDir, { recursive: true });
+    // Skip writing if npm (or a previous run) already stored this content.
+    const contentFile = path.join(contentDir, hex.slice(4));
+    if (!fs.existsSync(contentFile)) {
+      // Stage then rename, as cacache does, so a concurrent npm read never sees
+      // a half-written body (it would fail the integrity check and evict it).
+      const tmpFile = `${contentFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmpFile, buf);
+      fs.renameSync(tmpFile, contentFile);
+    }
+
+    const now = Date.now();
+    const entry = {
+      key,
+      integrity,
+      time: now,
+      size: buf.length,
+      // `metadata` is not optional. make-fetch-happen's CacheEntry constructor
+      // dereferences entry.metadata.time unconditionally, so an entry written
+      // without it makes *npm* throw "Cannot read properties of undefined
+      // (reading 'time')" the next time it consults the cache. This mirrors
+      // #getMetadata() field for field.
+      metadata: {
+        time: now,
+        url,
+        reqHeaders: { accept: PACKUMENT_ACCEPT },
+        resHeaders,
+        options: { compress: true },
+      },
+    };
+    const json = JSON.stringify(entry);
+    const s = sha256hex(key);
+    const indexDir = path.join(cache, 'index-v5', s.slice(0, 2), s.slice(2, 4));
+    fs.mkdirSync(indexDir, { recursive: true });
+    // Index files are append-only logs in which each record is separated by a
+    // LEADING newline (cacache/lib/entry-index.js #insert). Writing a trailing
+    // newline instead glues this record onto whatever the next writer appends,
+    // and cacache ejects any line whose sha1 doesn't verify — taking npm's own
+    // entry down with it.
+    fs.appendFileSync(path.join(indexDir, s.slice(4)), `\n${sha1hex(json)}\t${json}`);
+  } catch {
+    // Cache write failures are non-fatal.
+  }
+}
+
+function fetchPackument(name, registryBase) {
+  const url = registryBase + encodeURIComponent(name);
+  const cacheKey = `make-fetch-happen:request-cache:${url}`;
+  const cache = cacheRoot();
+
+  // Parse the cached body once. A cached packument is only usable if it
+  // contains publish dates: npm's own cached bodies are abbreviated "corgi"
+  // metadata (fetched with the install-v1 Accept header) which lack `time`.
+  const cached = readCache(cache, cacheKey);
+  if (cached) {
+    try {
+      const doc = JSON.parse(cached);
+      if (doc.time) return Promise.resolve({ doc, resHeaders: null });
+    } catch {
+      // fall through to network
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('http://') ? http : https;
+    const req = mod.get(
+      url,
+      {
+        agent: mod === https ? agent : httpAgent,
+        headers: {
+          accept: PACKUMENT_ACCEPT,
+          // Gzip cuts large packuments (e.g. zod: 4 MB -> 450 KB).
+          'accept-encoding': 'gzip',
+          'user-agent': 'npm-outdated-published/1.0 (+https://npmjs.org)',
+        },
+        timeout: 30000,
+      },
+      (res) => {
+        if (res.statusCode === 404) {
+          res.resume();
+          return resolve({ doc: null, resHeaders: null }); // package missing / unpublished
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`registry returned ${res.statusCode} for ${name}`));
+        }
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          try {
+            let buf = Buffer.concat(chunks);
+            if ((res.headers['content-encoding'] || '').includes('gzip')) {
+              buf = zlib.gunzipSync(buf);
+            }
+            const doc = JSON.parse(buf);
+            // Keep only the headers make-fetch-happen persists, so the index
+            // entry is indistinguishable from one npm wrote itself.
+            const resHeaders = {};
+            for (const name of KEEP_RESPONSE_HEADERS) {
+              if (res.headers[name] !== undefined) resHeaders[name] = res.headers[name];
+            }
+            // Store the decompressed body under the same key format npm uses,
+            // so npm can reuse these entries and vice versa.
+            writeCache(cache, cacheKey, url, buf, resHeaders);
+            resolve({ doc, resHeaders });
+          } catch (err) {
+            reject(new Error(`invalid response from registry for ${name}: ${err.message}`));
+          }
+        });
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error(`timed out fetching ${name}`)));
+    req.on('error', reject);
+  });
+}
+
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+// Default safety cooldown: packages published more recently than this are
+// flagged red and excluded from --upgrades/--major-upgrades.
+const DEFAULT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Parse an abbreviated time-ago string into milliseconds. Accepted forms:
+//   90s  30m  12h  7d  2w  3mo  1y   (also: 7, meaning 7 days)
+// Returns NaN if the value cannot be parsed.
+function parseCooldown(str) {
+  const m = String(str).trim().match(/^(\d+(?:\.\d+)?)\s*(s|m|h|d|w|mo|y)?$/i);
+  if (!m) return NaN;
+  const n = parseFloat(m[1]);
+  const unit = (m[2] || 'd').toLowerCase();
+  const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000, mo: 2592000000, y: 31536000000 };
+  return n * mult[unit];
+}
+
+function usage() {
+  const prog = path.basename(process.argv[1] || 'odd');
+  console.log(`Usage: ${prog} [options] [path]
+
+Check a project's package.json for outdated dependencies, like \`npm outdated\`,
+and add a "Published" column showing how long ago the latest version of each
+package was published. Packages published within the cooldown period are
+highlighted in red.
+
+The project directory defaults to the current directory, walking up parent
+directories until a package.json is found.
+
+Options:
+  -h, --help          Show this help message and exit
+
+  -u, --upgrades      Print space-separated names of outdated packages that are
+                      safe to upgrade (latest version published before the
+                      cooldown) AND actionable by \`npm upgrade\` (the declared
+                      version spec allows moving to a newer version). Intended
+                      for: npm upgrade $(${prog} -u)
+
+  -m, --major-upgrades
+                      The inverse of --upgrades: packages that are safe to
+                      upgrade but whose version spec blocks \`npm upgrade\`
+                      (wanted === current while a newer latest exists). Names
+                      get an \`@latest\` suffix for forcing with:
+                      npm install $(${prog} -m)
+
+  -c, --cooldown <time>
+                      Set the safety cooldown used for the red highlight and
+                      the --upgrades/--major-upgrades filters. <time> is an
+                      abbreviated duration: 90s, 30m, 12h, 7d, 2w, 3mo, 1y
+                      (a bare number means days). Default: 7d
+
+Exit status:
+  0  no outdated packages were found (or in --upgrades/--major-upgrades mode)
+  1  outdated packages were found, or an error occurred
+
+Environment:
+  ODD_CACHE_DIR       Override npm's cache location (default ~/.npm/_cacache)
+  ODD_CACHE_TTL       Cache trust window in minutes (default 60; 0 disables)
+  NO_COLOR            Disable colored output
+  FORCE_COLOR         Force colored output even when not attached to a TTY`);
+}
+
+// Find the nearest package.json, starting at `startDir` and walking up parents.
+function findProjectDir(startDir) {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null; // reached filesystem root
+    dir = parent;
+  }
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes('-h') || args.includes('--help')) {
+    usage();
+    return 0;
+  }
+  const upgradesOnly = args.includes('-u') || args.includes('--upgrades');
+  const majorUpgradesOnly = args.includes('-m') || args.includes('--major-upgrades');
+
+  // -c/--cooldown takes a value: either the next arg or an = suffix.
+  let cooldownArg = null;
+  let cooldownValueIndex = -1;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-c' || a === '--cooldown') {
+      cooldownArg = args[i + 1];
+      cooldownValueIndex = i + 1;
+      if (cooldownArg === undefined || cooldownArg.startsWith('-')) {
+        console.error(`npm error ${a} requires a time value (e.g. 7d, 12h, 2w)`);
+        return 1;
+      }
+      break;
+    }
+    const eq = a.match(/^(?:-c|--cooldown)=(.+)$/);
+    if (eq) {
+      cooldownArg = eq[1];
+      break;
+    }
+  }
+  let cooldownMs = DEFAULT_COOLDOWN_MS;
+  if (cooldownArg !== null) {
+    cooldownMs = parseCooldown(cooldownArg);
+    if (!Number.isFinite(cooldownMs) || cooldownMs < 0) {
+      console.error(`npm error invalid cooldown value: ${cooldownArg} (try 7d, 12h, 2w, 3mo)`);
+      return 1;
+    }
+  }
+
+  // Path candidate: first arg that isn't a flag or the cooldown's value.
+  const dirArg = args.find((a, i) => i !== cooldownValueIndex && !a.startsWith('-'));
+  let dir;
+  if (dirArg) {
+    dir = path.resolve(dirArg);
+    if (!fs.existsSync(path.join(dir, 'package.json'))) {
+      console.error(`npm error Could not read ${path.join(dir, 'package.json')}: no such file`);
+      return 1;
+    }
+  } else {
+    dir = findProjectDir(process.cwd());
+    if (dir === null) {
+      console.error('npm error Could not find a package.json in the current directory or any parent');
+      return 1;
+    }
+  }
+  const pkgPath = path.join(dir, 'package.json');
+
+  // "Depended by" (npm outdated): Arborist names the root node from its
+  // folder (@scope/name when the parent directory is a scope), which is what
+  // npm prints for direct dependencies — not package.json's "name" field.
+  const parentBase = path.basename(path.dirname(dir));
+  const dirBase = path.basename(dir);
+  const dependent = parentBase.startsWith('@') ? `${parentBase}/${dirBase}` : dirBase;
+
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  } catch (err) {
+    console.error(`npm error Could not read ${pkgPath}: ${err.message}`);
+    return 1;
+  }
+
+  // Collect dependencies of every type, first definition wins per package.
+  const depTypes = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+  const deps = new Map();
+  for (const type of depTypes) {
+    for (const [name, range] of Object.entries(pkg[type] || {})) {
+      if (!deps.has(name)) deps.set(name, { range, type });
+    }
+  }
+  if (deps.size === 0) return 0;
+
+  // Determine currently installed versions from node_modules.
+  for (const [name, info] of deps) {
+    try {
+      const installed = JSON.parse(
+        fs.readFileSync(path.join(dir, 'node_modules', name, 'package.json'), 'utf8')
+      );
+      info.current = parseVersion(installed.version) ? installed.version : null;
+    } catch {
+      info.current = null;
+    }
+  }
+
+  const registry =
+    (process.env.NPM_CONFIG_REGISTRY || process.env.npm_config_registry || 'https://registry.npmjs.org/')
+      .replace(/\/?$/, '/');
+
+  // Spinner only for the human table; --upgrades/--major-upgrades emit shell
+  // strings and must keep stdout clean. npm also disables it when stderr is
+  // not a TTY or when running under CI.
+  const tableMode = !upgradesOnly && !majorUpgradesOnly;
+  const spinnerEnabled =
+    tableMode &&
+    process.stderr.isTTY &&
+    !process.env.CI &&
+    process.env.NPM_CONFIG_PROGRESS !== 'false' &&
+    process.env.npm_config_progress !== 'false';
+  if (spinnerEnabled) {
+    progress.load({ enabled: true, unicode: process.stdout.isTTY ? process.platform !== 'win32' : false });
+  }
+
+  const names = [...deps.keys()];
+  let packuments;
+  try {
+    packuments = await mapLimit(names, 8, async (name) => {
+      try {
+        return (await fetchPackument(name, registry)).doc;
+      } catch (err) {
+        console.error(`npm error ${err.message}`);
+        return null;
+      }
+    });
+  } catch (err) {
+    console.error(`npm error ${err.message}`);
+    return 1;
+  }
+
+  const rows = [];
+  names.forEach((name, i) => {
+    const info = deps.get(name);
+    const doc = packuments[i];
+    const latest = doc && doc['dist-tags'] ? doc['dist-tags'].latest || null : null;
+    const latestParsed = latest ? parseVersion(latest) : null;
+
+    // "Wanted": the highest version satisfying the declared range.
+    let wanted = null;
+    if (doc && doc.versions) {
+      for (const v of Object.keys(doc.versions)) {
+        const parsed = parseVersion(v);
+        if (parsed && satisfies(parsed, info.range)) {
+          if (!wanted || cmpVersions(parsed, parseVersion(wanted)) > 0) wanted = v;
+        }
+      }
+    }
+    if (!wanted) wanted = latest; // unparseable range or nothing satisfies
+
+    const current = info.current;
+    const isOutdated = current === null || !latestParsed || cmpVersions(parseVersion(current), latestParsed) !== 0;
+    if (!isOutdated) return;
+
+    let published = null;
+    if (doc && doc.time && latest && doc.time[latest]) {
+      published = humanizeDuration(Date.now() - Date.parse(doc.time[latest]));
+    }
+
+    rows.push({
+      name,
+      current,
+      wanted,
+      latest,
+      published,
+      publishedMs: doc && doc.time && latest && doc.time[latest] ? Date.now() - Date.parse(doc.time[latest]) : null,
+      location: `node_modules/${name}`,
+    });
+  });
+
+  rows.sort((a, b) => a.name.localeCompare(b.name));
+
+  progress.off();
+
+  if (rows.length === 0) return 0;
+
+  if (upgradesOnly || majorUpgradesOnly) {
+    // Both modes keep the publish-age safety filter (same criteria as the red
+    // highlight, inverted: published BEFORE the cooldown; unknown dates are
+    // excluded). They differ on actionability:
+    //   --upgrades        `npm upgrade` moves a package to `wanted` (the
+    //                     highest version satisfying the declared range), so
+    //                     it only acts when wanted > current. Packages whose
+    //                     spec pins them below latest (wanted === current) are
+    //                     omitted here.
+    //   --major-upgrades  the inverse: specs that block `npm upgrade` (wanted
+    //                     === current while latest is newer, or the package is
+    //                     not installed). Names get an @latest suffix so they
+    //                     can be forced with `npm install <name>@latest`.
+    const safe = rows.filter(
+      (r) => r.publishedMs !== null && r.publishedMs >= cooldownMs
+    );
+    const selected = safe.filter((r) => {
+      const actionable =
+        r.current !== null &&
+        r.wanted !== null &&
+        cmpVersions(parseVersion(r.wanted), parseVersion(r.current)) > 0;
+      return upgradesOnly ? actionable : !actionable;
+    });
+    const names = selected.map((r) => (majorUpgradesOnly ? `${r.name}@latest` : r.name));
+    if (names.length > 0) console.log(names.join(' '));
+    return 0;
+  }
+
+  const header = ['Package', 'Current', 'Wanted', 'Latest', 'Published', 'Location', 'Depended by'];
+  // Column alignment mirrors npm's text-table config: ['l','r','r','r','l'];
+  // text-table left-aligns columns it has no entry for, so Depended by is left.
+  const aligns = ['l', 'r', 'r', 'r', 'l', 'l', 'l'];
+  const cells = rows.map((r) => {
+    const current = r.current === null ? 'MISSING' : r.current;
+    return [
+      // npm: yellow when current===wanted (in-range update), red otherwise.
+      colorize(r.name, current === r.wanted ? COLORS.yellow : COLORS.red),
+      current,
+      colorize(r.wanted || 'MISSING', COLORS.cyan),
+      colorize(r.latest || 'MISSING', COLORS.blue),
+      // Our addition: red when published within the cooldown window.
+      r.published === null
+        ? 'MISSING'
+        : r.publishedMs !== null && r.publishedMs < cooldownMs
+          ? colorize(r.published, COLORS.red)
+          : r.published,
+      r.location,
+      dependent,
+    ];
+  });
+
+  const widths = header.map((h, i) =>
+    Math.max(h.length, ...cells.map((row) => visibleWidth(row[i])))
+  );
+
+  const align = (str, i) => (aligns[i] === 'r' ? alignRight(str, widths[i]) : alignLeft(str, widths[i]));
+
+  // Colorize the header word first, then align: padding lands outside the
+  // escape codes so the underline covers only the word, as in `npm outdated`.
+  // text-table strips trailing whitespace per line (index.js #53); do the same.
+  const out = [];
+  out.push(header.map((h, i) => align(colorize(h, COLORS.boldUnderline), i)).join('  ').replace(/\s+$/, ''));
+  for (const row of cells) {
+    out.push(row.map(align).join('  ').replace(/\s+$/, ''));
+  }
+  console.log(out.join('\n'));
+
+  return 1; // matching `npm outdated`: exit 1 when outdated packages exist
+}
+
+main()
+  .then((code) => {
+    progress.off();
+    agent.destroy();
+    httpAgent.destroy();
+    process.exit(code);
+  })
+  .catch((err) => {
+    progress.off();
+    console.error(`npm error ${err && err.stack ? err.stack : err}`);
+    process.exit(1);
+  });
